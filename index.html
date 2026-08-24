@@ -493,9 +493,10 @@ async function startCall(chat){
     voice.busy=false;
     if(!ok){toast('Нет доступа к микрофону (нужен https)');return;}
     
-    call={isGroup:chat.type==='grp',gid:chat.type==='grp'?chat.gid:null,chatId:chat.id,state:'calling',members:members,peers:{},callerId:me.login,startTs:0};
+    const cid = chat.type==='grp' ? chat.gid : [me.login, chat.peer.login].sort().join('~');
+    call={isGroup:chat.type==='grp',gid:chat.type==='grp'?chat.gid:null,chatId:chat.id,cid:cid,state:'calling',members:members,peers:{},callerId:me.login,startTs:0};
     const others=members.filter(m=>m!==me.login);
-    others.forEach(m=>sig(m,{t:'call-req',isGroup:call.isGroup,gid:call.gid,members:call.members,fromName:me.name,cid:call.chatId}));
+    others.forEach(m=>sig(m,{t:'call-req',isGroup:call.isGroup,gid:call.gid,members:call.members,fromName:me.name,cid:call.cid}));
     startRingTone('out');
     call.noAnsT=setTimeout(()=>{if(call&&call.state==='calling')finishCall('noanswer');},45000);
     renderCall();
@@ -510,14 +511,14 @@ async function acceptCall(){
     if(!ok){toast('Нет доступа к микрофону (нужен https)');finishCall('failed');return;}
     call.state='connecting';
     const others=call.members.filter(m=>m!==me.login);
-    others.forEach(m=>sig(m,{t:'call-accept',cid:call.chatId}));
+    others.forEach(m=>sig(m,{t:'call-accept',cid:call.cid}));
     stopRingTone();
     renderCall();
     others.forEach(m=>{
         if(me.login<m){
             const peer=ensurePC(m);
             if(peer){
-                peer.pc.createOffer().then(offer=>{peer.pc.setLocalDescription(offer);sig(m,{t:'webrtc-offer',cid:call.chatId,sdp:peer.pc.localDescription});}).catch(()=>{});
+                peer.pc.createOffer().then(offer=>{peer.pc.setLocalDescription(offer);sig(m,{t:'webrtc-offer',cid:call.cid,sdp:peer.pc.localDescription});}).catch(()=>{});
             }
         }
     });
@@ -528,7 +529,7 @@ function ensurePC(peerLogin){
     const pc=new RTCPeerConnection(RTC_CFG);
     const peer={pc,state:'connecting',pendingIce:[],audioEl:null,videoStream:null,name:(dir[peerLogin]&&dir[peerLogin].name)||peerLogin};
     call.peers[peerLogin]=peer;
-    pc.onicecandidate=e=>{if(e.candidate&&call)sig(peerLogin,{t:'ice',cid:call.chatId,cand:e.candidate});};
+    pc.onicecandidate=e=>{if(e.candidate&&call)sig(peerLogin,{t:'ice',cid:call.cid,cand:e.candidate});};
     pc.ontrack=e=>{
         if(!call||!call.peers[peerLogin])return;
         const p=call.peers[peerLogin];
@@ -637,7 +638,7 @@ function finishCall(reason){
     clearInterval(c.timerInt);
     
     if(reason!=='remote'&&reason!=='missed'){
-        c.members.filter(m=>m!==me.login).forEach(m=>sig(m,{t:'call-end',cid:c.chatId}));
+        c.members.filter(m=>m!==me.login).forEach(m=>sig(m,{t:'call-end',cid:c.cid}));
     }
     Object.values(c.peers).forEach(p=>{
         if(p.pc)try{p.pc.close();}catch(e){}
@@ -679,47 +680,53 @@ function onSignal(m){
         case'call-req':
             if(call){sig(m.from,{t:'call-busy',cid:m.cid});return;}
             const chat=m.isGroup?ensureGroup(m.gid):ensureDM(m.from);
-            call={isGroup:!!m.isGroup,gid:m.gid||null,chatId:chat.id,state:'incoming',members:m.members,peers:{},callerId:m.from,startTs:0};
+            call={isGroup:!!m.isGroup,gid:m.gid||null,chatId:chat.id,cid:m.cid,state:'incoming',members:m.members,peers:{},callerId:m.from,startTs:0};
             renderCall();startRingTone('in');flashTitle(true);
             notify('Входящий звонок',m.isGroup?chat.name:(m.fromName||(dir[m.from]&&dir[m.from].name)||m.from));
             call.noAnsT=setTimeout(()=>{if(call&&call.state==='incoming')finishCall('missed');},40000);
             break;
         case'call-accept':
-            if(!call||call.chatId!==m.cid)return;
+            if(!call || call.cid !== m.cid) return;
             if(me.login<m.from){
                 const peer=ensurePC(m.from);
                 if(peer){
-                    peer.pc.createOffer().then(offer=>{peer.pc.setLocalDescription(offer);sig(m.from,{t:'webrtc-offer',cid:call.chatId,sdp:peer.pc.localDescription});}).catch(()=>{});
+                    peer.pc.createOffer().then(offer=>{peer.pc.setLocalDescription(offer);sig(m.from,{t:'webrtc-offer',cid:call.cid,sdp:peer.pc.localDescription});}).catch(()=>{});
                 }
+            }
+            // Переход вызываемого в статус "соединение"
+            if(call.state === 'calling') {
+                call.state = 'connecting';
+                stopRingTone();
+                renderCall();
             }
             break;
         case'webrtc-offer':
-            if(!call||call.chatId!==m.cid)return;
+            if(!call || call.cid !== m.cid) return;
             const pOff=ensurePC(m.from);
             if(!pOff)return;
             pOff.pc.setRemoteDescription(new RTCSessionDescription(m.sdp)).then(async()=>{
                 const ans=await pOff.pc.createAnswer();
                 await pOff.pc.setLocalDescription(ans);
-                sig(m.from,{t:'webrtc-answer',cid:call.chatId,sdp:ans});
+                sig(m.from,{t:'webrtc-answer',cid:call.cid,sdp:ans});
                 pOff.pendingIce.forEach(c=>pOff.pc.addIceCandidate(c).catch(()=>{}));
                 pOff.pendingIce=[];
             }).catch(()=>{});
             break;
         case'webrtc-answer':
-            if(!call||call.chatId!==m.cid||!call.peers[m.from])return;
+            if(!call || call.cid !== m.cid || !call.peers[m.from]) return;
             call.peers[m.from].pc.setRemoteDescription(new RTCSessionDescription(m.sdp)).then(()=>{
                 call.peers[m.from].pendingIce.forEach(c=>call.peers[m.from].pc.addIceCandidate(c).catch(()=>{}));
                 call.peers[m.from].pendingIce=[];
             }).catch(()=>{});
             break;
         case'ice':
-            if(!call||call.chatId!==m.cid||!call.peers[m.from])return;
+            if(!call || call.cid !== m.cid || !call.peers[m.from]) return;
             const pIce=call.peers[m.from];
             if(pIce.pc.remoteDescription)pIce.pc.addIceCandidate(new RTCIceCandidate(m.cand)).catch(()=>{});
             else pIce.pendingIce.push(m.cand);
             break;
         case'call-end':
-            if(!call||call.chatId!==m.cid)return;
+            if(!call || call.cid !== m.cid) return;
             if(call.peers[m.from]){
                 try{call.peers[m.from].pc.close();}catch(e){}
                 if(call.peers[m.from].audioEl)call.peers[m.from].audioEl.remove();
@@ -728,12 +735,11 @@ function onSignal(m){
                 renderCall();
                 if(Object.keys(call.peers).length===0 && call.state==='active'){finishCall('remote');}
             } else if(call.state==='incoming' || (call.state==='calling' && call.callerId===me.login)){
-                // They rejected or cancelled before connecting
                 finishCall(call.state==='incoming'?'missed':'remote');
             }
             break;
         case'call-busy':
-            if(call&&call.state==='calling'&&call.chatId===m.cid){
+            if(call && call.state==='calling' && call.cid === m.cid){
                 toast((dir[m.from]&&dir[m.from].name||m.from)+' занят');
                 if(!call.isGroup) finishCall('busy');
             }
@@ -752,7 +758,7 @@ async function toggleShare(){
         track.onended=()=>stopShare();
         Object.values(call.peers).forEach(p=>{p.screenSender=p.pc.addTrack(track,s);});
         await Promise.all(Object.entries(call.peers).map(async([login,p])=>{
-            try{const offer=await p.pc.createOffer();await p.pc.setLocalDescription(offer);sig(login,{t:'webrtc-offer',cid:call.chatId,sdp:p.pc.localDescription,renego:true});}catch(e){}
+            try{const offer=await p.pc.createOffer();await p.pc.setLocalDescription(offer);sig(login,{t:'webrtc-offer',cid:call.cid,sdp:p.pc.localDescription,renego:true});}catch(e){}
         }));
         $('#selfPip').srcObject=s;
         renderCall();
@@ -771,7 +777,7 @@ function stopShare(silent){
         });
         if(!silent){
             Object.entries(call.peers).forEach(async([login,p])=>{
-                try{const offer=await p.pc.createOffer();await p.pc.setLocalDescription(offer);sig(login,{t:'webrtc-offer',cid:call.chatId,sdp:p.pc.localDescription,renego:true});}catch(e){}
+                try{const offer=await p.pc.createOffer();await p.pc.setLocalDescription(offer);sig(login,{t:'webrtc-offer',cid:call.cid,sdp:p.pc.localDescription,renego:true});}catch(e){}
             });
         }
     }
@@ -860,7 +866,7 @@ function adminDeleteUser(login){if(!dir[login])return;pubRaw(P+'dir/'+login);pub
 document.querySelectorAll('[data-close]').forEach(b=>b.addEventListener('click',closeModal));
  $('#gmCreate').addEventListener('click',()=>{const name=$('#gmName').value.trim();const members=[...document.querySelectorAll('#gmList input:checked')].map(i=>i.value);if(!name){toast('Введите название');return;}if(!members.length){toast('Выберите участников');return;}const gid=uid()+uid();const all=[me.login,...members];pub(grpMeta(gid),{gid,name,members:all},true);groups[gid]={gid,name};const c=ensureGroup(gid);c.name=name;c.members=all;closeModal();renderChatList();openChat('g:'+gid);toast('Группа создана');});
 function publishProfile(){pub(P+'dir/'+me.login,{login:me.login,name:me.name,ph:me.ph,salt:me.salt,st:me.st||'online',ava:me.ava},true);}
- $('#pmAvaBtn').addEventListener('click',()=>{const f=$('#pmAvaIn').files[0];if(!f)return;if(f.size>5000000){toast('Файл большой');return;}const r=new FileReader();r.onload=()=>{const img=new Image();img.onload=()=>{const c=document.createElement('canvas');let w=img.width,h=img.height;const max=256;if(w>max){h=h*max/w;w=max;}if(h>max){w=w*max/h;h=max;}c.width=w;c.height=h;c.getContext('2d').drawImage(img,0,0,w,h);const b64=c.toDataURL('image/jpeg',0.85).split(',')[1];if(b64&&b64.length<60000){me.ava=b64;publishProfile();$('#pmAva').innerHTML=ava(me.name,58,me.login,me);$('#meAva').outerHTML=ava(me.name,38,me.login,me).replace('class="avatar','class="avatar" id="meAva"');renderPeople();renderChatList();toast('Аватарка установлена');}else{toast('Слишком большая');}};img.onerror=()=>toast('Не удалось');img.src=r.result;};r.readAsDataURL(f);$('#pmAvaIn').value='';});
+ $('#pmAvaBtn').addEventListener('click',()=>{const f=$('#pmAvaIn').files[1];if(!f)return;if(f.size>5000000){toast('Файл большой');return;}const r=new FileReader();r.onload=()=>{const img=new Image();img.onload=()=>{const c=document.createElement('canvas');let w=img.width,h=img.height;const max=256;if(w>max){h=h*max/w;w=max;}if(h>max){w=w*max/h;h=max;}c.width=w;c.height=h;c.getContext('2d').drawImage(img,0,0,w,h);const b64=c.toDataURL('image/jpeg',0.85).split(',')[1];if(b64&&b64.length<60000){me.ava=b64;publishProfile();$('#pmAva').innerHTML=ava(me.name,58,me.login,me);$('#meAva').outerHTML=ava(me.name,38,me.login,me).replace('class="avatar','class="avatar" id="meAva"');renderPeople();renderChatList();toast('Аватарка установлена');}else{toast('Слишком большая');}};img.onerror=()=>toast('Не удалось');img.src=r.result;};r.readAsDataURL(f);$('#pmAvaIn').value='';});
  $('#pmSave').addEventListener('click',()=>{const n=$('#pmNameIn').value.trim().slice(0,24);if(!n){toast('Имя не может быть пустым');return;}me.name=n;publishProfile();$('#meName').textContent=n;renderHeader();renderPeople();toast('Имя обновлено');});
  $('#pmStatus').addEventListener('change',e=>{me.st=e.target.value;publishProfile();renderPeople();toast('Статус: '+(STATUSES[me.st]||'В сети'));});
  $('#pmTheme').addEventListener('change',e=>{applyTheme(e.target.value);toast('Тема применена');});
@@ -898,9 +904,9 @@ setInterval(()=>{if(!me)return;publishPresence();const now=Date.now();let ch=fal
 setInterval(()=>{if(me)updateShabbat();},30000);
 window.addEventListener('focus',()=>{if(me&&activeChat&&chats[activeChat]){seenTS[activeChat]=Date.now();saveSeen();chats[activeChat].unread=0;renderChatList();renderTabs();updateTitle();}});
 document.addEventListener('visibilitychange',()=>{if(!document.hidden&&netOnline){conns.forEach(c=>{if(!c.connected){clearTimeout(c.retryT);connConnect(c);}});if(me)publishPresence();}});
-window.addEventListener('pagehide',()=>{try{if(call)sigEnd(call.chatId);goBye();}catch(e){}});
-window.addEventListener('beforeunload',()=>{try{if(call)sigEnd(call.chatId);goBye();}catch(e){}});
-(function init(){BASE_SUBS.forEach(want);startNet();if(shabbat().active)$('#wShabbat').hidden=false;stLine($('#liStatus'),'Соединение с серверами…');$('#micVol').value=audioPrefs.micVol;$('#spkVol').value=audioPrefs.spkVol;$('#micVolLabel').textContent=audioPrefs.micVol+'%';$('#spkVolLabel').textContent=audioPrefs.spkVol+'%';})();
+window.addEventListener('pagehide',()=>{try{if(call)sigEnd(call.cid);goBye();}catch(e){}});
+window.addEventListener('beforeunload',()=>{try{if(call)sigEnd(call.cid);goBye();}catch(e){}});
+(function init(){BASE_SUBS.forEach(want);startNet();if(shabbat().active)$('#wShabbat').hidden=false;stLine($('#liStatus'),'Соединение с серверами…';$('#micVol').value=audioPrefs.micVol;$('#spkVol').value=audioPrefs.spkVol;$('#micVolLabel').textContent=audioPrefs.micVol+'%';$('#spkVolLabel').textContent=audioPrefs.spkVol+'%';})();
 </script>
 </body>
 </html>
